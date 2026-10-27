@@ -1,0 +1,15 @@
+[package]
+name = "pagedb"
+version = "0.1.0"
+edition = "2021"
+description = "Page-based relational storage engine: buffer pool, B+ tree, WAL, ARIES-style recovery, 2PL"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.test]
+opt-level = 1
