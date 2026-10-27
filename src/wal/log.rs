@@ -144,7 +144,15 @@ impl LogManager {
         if g.buf.is_empty() {
             return Ok(());
         }
+        if let Err(e) = crate::failpoint::hit() {
+            if crate::failpoint::torn() {
+                write_all_at(&g.file, &g.buf[..g.buf.len() / 2], g.durable)?;
+            }
+            return Err(e);
+        }
         write_all_at(&g.file, &g.buf, g.durable)?;
+        // data is in the file but we may die before learning the sync finished
+        crate::failpoint::hit()?;
         g.file.sync_data()?;
         g.durable += g.buf.len() as u64;
         g.buf.clear();
@@ -208,12 +216,14 @@ impl LogManager {
     pub fn set_checkpoint(&self, lsn: Lsn) -> Result<()> {
         let mut b = lsn.to_le_bytes().to_vec();
         b.extend_from_slice(&crc32(&[&b]).to_le_bytes());
+        crate::failpoint::hit()?;
         let tmp = self.master.with_extension("master.tmp");
         {
             let f = File::create(&tmp)?;
             write_all_at(&f, &b, 0)?;
             f.sync_all()?;
         }
+        crate::failpoint::hit()?;
         fs::rename(&tmp, &self.master)?;
         self.ckpt.store(lsn, Release);
         Ok(())

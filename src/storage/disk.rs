@@ -123,12 +123,20 @@ impl DiskManager {
         // caller only holds a shared latch, so stamp a copy
         let mut tmp = Box::new(*buf);
         stamp_checksum(&mut tmp);
-        write_all_at(&self.file, &tmp[..], pid as u64 * PAGE_SIZE as u64)?;
+        let off = pid as u64 * PAGE_SIZE as u64;
+        if let Err(e) = crate::failpoint::hit() {
+            if crate::failpoint::torn() {
+                write_all_at(&self.file, &tmp[..PAGE_SIZE / 2], off)?;
+            }
+            return Err(e);
+        }
+        write_all_at(&self.file, &tmp[..], off)?;
         self.writes.fetch_add(1, Relaxed);
         Ok(())
     }
 
     pub fn sync(&self) -> Result<()> {
+        crate::failpoint::hit()?;
         self.file.sync_data()?;
         Ok(())
     }

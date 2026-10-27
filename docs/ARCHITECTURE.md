@@ -160,6 +160,14 @@ Strict two-phase locking, so schedules are serializable.
 
 ## Testing
 
+**Fault injection** (`src/failpoint.rs`, `tests/fault_injection.rs`): every durable I/O call (page write,
+log flush, fsync, checkpoint master record) can be made to fail. The test fails the Nth I/O event for
+*every* N across a workload, optionally leaving the write half-finished (torn page / torn log tail),
+reopens, and requires the recovered database to equal either the set of acknowledged commits or that
+set plus the one commit that was in flight. A second sweep kills recovery itself at each of its own
+I/O points and recovers again. Deliberately breaking the WAL rule makes it fail at the 11th event,
+so it does detect real violations.
+
 `cargo test` runs: unit tests per module, B+ tree model-checking against `BTreeMap` (random
 ops, tiny pools, concurrent writers/scanners/deleters, structure check), transaction semantics
 (dirty read, phantom, deadlock, a concurrent bank-transfer invariant with an auditor), recovery
