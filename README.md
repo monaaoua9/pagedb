@@ -1,5 +1,7 @@
 # pagedb
 
+[![ci](https://github.com/monaaoua9/pagedb/actions/workflows/ci.yml/badge.svg)](https://github.com/monaaoua9/pagedb/actions/workflows/ci.yml) [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Page-based storage engine in Rust: buffer pool, disk-resident B+ tree, write-ahead log with
 ARIES-style recovery, and two-phase-locking transactions. No dependencies.
 

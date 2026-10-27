@@ -3,6 +3,8 @@ name = "pagedb"
 version = "0.1.0"
 edition = "2021"
 description = "Page-based relational storage engine: buffer pool, B+ tree, WAL, ARIES-style recovery, 2PL"
+license = "MIT"
+repository = "https://github.com/monaaoua9/pagedb"
 
 [dependencies]
 
