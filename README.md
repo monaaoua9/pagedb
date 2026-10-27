@@ -35,19 +35,27 @@ Design notes, invariants and the recovery protocol: [docs/ARCHITECTURE.md](docs/
 ```
 cargo test                           # unit + integration + crash fuzzer
 cargo run --release --example demo   # crash with a transaction in flight, recover
-cargo run --release --example bench
+cargo run --release --example bench   # quick numbers
+(cd bench && cargo run --release)    # pagedb vs SQLite
 ```
 
-## Measured on a Windows 11 laptop (release build, NVMe, fsync on every commit)
+## Compared with SQLite
 
-| | |
-|---|---|
-| bulk insert, 200-row transactions | ~25k rows/s (commit fsync ≈ 2–3 ms of that) |
-| B+ tree insert alone (no locks, no fsync) | ~8.7 µs/row |
-| single-row commits | ~850 tps |
-| full scan, 200k rows | ~0.25 s |
+`bench/` is a separate crate (so the library keeps zero dependencies) that runs the same four workloads
+against pagedb and SQLite via `rusqlite`: 200k rows, 4-byte key, 100-byte value, fsync on every commit
+(SQLite in WAL mode with `synchronous=FULL`), both with a 32 MiB cache. Best of 3, Windows 11 laptop:
 
-Numbers vary a lot with the disk; they are here to show the order of magnitude, not as a benchmark claim.
+| | pagedb | SQLite |
+|---|---|---|
+| bulk insert (200-row transactions) | 71k rows/s | 92k rows/s |
+| random point read | 517k ops/s | 161k ops/s |
+| full scan, 200k rows | 46 ms | 82 ms |
+| single-row commit (fsync each) | 1056 tps | 825 tps |
+
+Read this fairly: SQLite is parsing and executing SQL and pagedb is a bare key/value API, so the read
+numbers say more about that overhead than about B-tree quality. The one workload where pagedb loses is
+bulk insert, where SQLite's tighter write path wins by about 30%. Run it with
+`cd bench && cargo run --release`; numbers depend heavily on the disk.
 
 ## Limits
 
