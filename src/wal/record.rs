@@ -98,7 +98,7 @@ impl Enc {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn bytes(&mut self, b: &[u8]) {
-        self.u16(b.len() as u16);
+        self.u32(b.len() as u32);
         self.0.extend_from_slice(b);
     }
 }
@@ -130,7 +130,7 @@ impl<'a> Dec<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn bytes(&mut self) -> Result<Vec<u8>> {
-        let n = self.u16()? as usize;
+        let n = self.u32()? as usize;
         Ok(self.take(n)?.to_vec())
     }
 }

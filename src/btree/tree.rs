@@ -19,6 +19,7 @@ pub struct TreeStats {
     pub leaves: usize,
     pub internals: usize,
     pub entries: usize,
+    pub overflow_pages: usize,
 }
 
 // The root page id never changes: when the root splits its contents move into
@@ -55,7 +56,78 @@ fn leaf_fits(n: &Node<&PageData>, found: std::result::Result<usize, usize>, need
     }
 }
 
+const INLINE: u8 = 0;
+const SPILLED: u8 = 1;
+
+fn raw_len(val: &[u8]) -> usize {
+    if val.len() > MAX_INLINE {
+        9
+    } else {
+        1 + val.len()
+    }
+}
+
 impl BTree {
+    // Values live in leaf cells as `tag | payload`: tag 0 = the bytes themselves,
+    // tag 1 = total length u32 + first overflow page u32. Splits and merges move
+    // the raw form around and never look inside it.
+    fn read_raw(&self, raw: &[u8]) -> Result<Vec<u8>> {
+        if raw[0] == INLINE {
+            return Ok(raw[1..].to_vec());
+        }
+        let total = u32::from_le_bytes(raw[1..5].try_into().unwrap()) as usize;
+        let mut pid = PageId::from_le_bytes(raw[5..9].try_into().unwrap());
+        let mut out = Vec::with_capacity(total);
+        while pid != INVALID_PAGE {
+            let g = self.pool.fetch_read(pid)?;
+            let n = Node(&*g);
+            if n.kind() != KIND_OVERFLOW {
+                return corrupt(format!("page {pid} in an overflow chain has kind {}", n.kind()));
+            }
+            out.extend_from_slice(n.overflow_data());
+            pid = n.link();
+        }
+        if out.len() != total {
+            return corrupt("overflow chain length does not match the cell");
+        }
+        Ok(out)
+    }
+
+    fn make_raw(&self, mtr: &mut Mtr<'_>, val: &[u8]) -> Result<Vec<u8>> {
+        if val.len() <= MAX_INLINE {
+            let mut r = Vec::with_capacity(1 + val.len());
+            r.push(INLINE);
+            r.extend_from_slice(val);
+            return Ok(r);
+        }
+        let chunks: Vec<&[u8]> = val.chunks(OVF_CAP).collect();
+        let idx: Vec<usize> = chunks.iter().map(|_| mtr.alloc()).collect::<Result<_>>()?;
+        let pids: Vec<PageId> = idx.iter().map(|&i| mtr.pid(i)).collect();
+        for (k, c) in chunks.iter().enumerate() {
+            let next = pids.get(k + 1).copied().unwrap_or(INVALID_PAGE);
+            Node(mtr.page_mut(idx[k])).init_overflow(next, c);
+        }
+        let mut r = vec![SPILLED];
+        r.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        r.extend_from_slice(&pids[0].to_le_bytes());
+        Ok(r)
+    }
+
+    fn free_chain(&self, mtr: &mut Mtr<'_>, raw: &[u8]) -> Result<()> {
+        if raw[0] != SPILLED {
+            return Ok(());
+        }
+        let mut pid = PageId::from_le_bytes(raw[5..9].try_into().unwrap());
+        while pid != INVALID_PAGE {
+            let i = mtr.latch(pid)?;
+            let next = Node(mtr.page(i)).link();
+            Node(mtr.page_mut(i)).init(KIND_FREE, 0, INVALID_PAGE);
+            mtr.free_later(pid);
+            pid = next;
+        }
+        Ok(())
+    }
+
     pub fn open(root: PageId, pool: Arc<BufferPool>, log: Arc<LogManager>) -> Self {
         BTree { root, pool, log }
     }
@@ -100,7 +172,10 @@ impl BTree {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let g = self.find_leaf(key)?;
         let n = Node(&*g);
-        Ok(n.search(key).ok().map(|i| n.val(i).to_vec()))
+        match n.search(key) {
+            Ok(i) => Ok(Some(self.read_raw(n.val(i))?)),
+            Err(_) => Ok(None),
+        }
     }
 
     // f runs with a leaf latch held, so keep it cheap and don't call back into the tree
@@ -137,7 +212,12 @@ impl BTree {
                         Bound::Excluded(u) => k >= u,
                         Bound::Unbounded => false,
                     };
-                    if past || !f(k, n.val(i)) {
+                    if past {
+                        return Ok(());
+                    }
+                    let raw = n.val(i);
+                    let go = if raw[0] == INLINE { f(k, &raw[1..]) } else { f(k, &self.read_raw(raw)?) };
+                    if !go {
                         return Ok(());
                     }
                     last = Some(i);
@@ -276,14 +356,13 @@ impl BTree {
         if val.len() > MAX_VALUE {
             return Err(Error::ValueTooLarge);
         }
-        let cell = leaf_cell(key, val);
-        let need = cell.len() + 2;
+        let need = 4 + key.len() + raw_len(val) + 2;
         let mut mtr = Mtr::new(&self.pool, &self.log);
 
         if let Some(li) = self.optimistic_leaf(&mut mtr, key)? {
             let found = Node(mtr.page(li)).search(key);
             if leaf_fits(&Node(mtr.page(li)), found, need) {
-                return self.finish_leaf_write(mtr, li, found, key, &cell, mode, absent_only);
+                return self.finish_leaf_write(mtr, li, found, key, val, mode, absent_only);
             }
             mtr.release(li);
         }
@@ -298,16 +377,18 @@ impl BTree {
         let li = *path.last().unwrap();
         let found = Node(mtr.page(li)).search(key);
         if leaf_fits(&Node(mtr.page(li)), found, need) {
-            return self.finish_leaf_write(mtr, li, found, key, &cell, mode, absent_only);
+            return self.finish_leaf_write(mtr, li, found, key, val, mode, absent_only);
         }
 
         // leaf is full, split
         let existing = match found {
             Ok(i) => {
-                let old = Node(mtr.page(li)).val(i).to_vec();
+                let oldraw = Node(mtr.page(li)).val(i).to_vec();
+                let old = self.read_raw(&oldraw)?;
                 if absent_only {
                     return Ok(Some(old));
                 }
+                self.free_chain(&mut mtr, &oldraw)?;
                 Node(mtr.page_mut(li)).remove_cell(i);
                 Some(old)
             }
@@ -315,7 +396,8 @@ impl BTree {
         };
         let pos = Node(mtr.page(li)).search(key).unwrap_err();
         let mut ents = Node(mtr.page(li)).leaf_entries();
-        ents.insert(pos, (key.to_vec(), val.to_vec()));
+        let raw = self.make_raw(&mut mtr, val)?;
+        ents.insert(pos, (key.to_vec(), raw));
         let at_end = pos == ents.len() - 1 && Node(mtr.page(li)).link() == INVALID_PAGE;
         let is_root = mtr.pid(li) == self.root;
         let mut carry = self.split_leaf(&mut mtr, li, ents, at_end, is_root)?;
@@ -358,22 +440,25 @@ impl BTree {
         li: usize,
         found: std::result::Result<usize, usize>,
         key: &[u8],
-        cell: &[u8],
+        val: &[u8],
         mode: &LogMode,
         absent_only: bool,
     ) -> Result<Option<Vec<u8>>> {
         let (pos, old) = match found {
             Ok(i) => {
-                let old = Node(mtr.page(li)).val(i).to_vec();
+                let oldraw = Node(mtr.page(li)).val(i).to_vec();
+                let old = self.read_raw(&oldraw)?;
                 if absent_only {
                     return Ok(Some(old));
                 }
+                self.free_chain(&mut mtr, &oldraw)?;
                 Node(mtr.page_mut(li)).remove_cell(i);
                 (i, Some(old))
             }
             Err(p) => (p, None),
         };
-        assert!(Node(mtr.page_mut(li)).insert_cell(pos, cell));
+        let raw = self.make_raw(&mut mtr, val)?;
+        assert!(Node(mtr.page_mut(li)).insert_cell(pos, &leaf_cell(key, &raw)));
         let undo = self.undo_for(key, &old);
         self.commit(mtr, mode, undo)?;
         Ok(old)
@@ -454,7 +539,9 @@ impl BTree {
                 Ok(i) => {
                     let after = n.used() - (n.cell_len(i) + 2);
                     if mtr.pid(li) == self.root || after >= MIN_FILL {
-                        let old = n.val(i).to_vec();
+                        let oldraw = n.val(i).to_vec();
+                        let old = self.read_raw(&oldraw)?;
+                        self.free_chain(&mut mtr, &oldraw)?;
                         Node(mtr.page_mut(li)).remove_cell(i);
                         let undo = self.undo_for(key, &Some(old.clone()));
                         self.commit(mtr, mode, undo)?;
@@ -483,7 +570,9 @@ impl BTree {
             Ok(i) => i,
             Err(_) => return Ok(None),
         };
-        let old = Node(mtr.page(li)).val(i).to_vec();
+        let oldraw = Node(mtr.page(li)).val(i).to_vec();
+        let old = self.read_raw(&oldraw)?;
+        self.free_chain(&mut mtr, &oldraw)?;
         Node(mtr.page_mut(li)).remove_cell(i);
 
         let mut lvl = path.len() - 1;
@@ -687,6 +776,13 @@ impl BTree {
             st.leaves += 1;
             st.entries += n.len();
             leaves.push((pid, n.link()));
+            for i in 0..n.len() {
+                let raw = n.val(i);
+                if raw[0] == SPILLED {
+                    let v = self.read_raw(raw)?;
+                    st.overflow_pages += v.len().div_ceil(OVF_CAP);
+                }
+            }
             return Ok(());
         }
         if n.kind() != KIND_INTERNAL || n.is_empty() {

@@ -3,6 +3,7 @@ use crate::types::{PageId, PAGE_HEADER, PAGE_SIZE};
 pub const KIND_FREE: u8 = 0;
 pub const KIND_LEAF: u8 = 1;
 pub const KIND_INTERNAL: u8 = 2;
+pub const KIND_OVERFLOW: u8 = 3;
 
 const OFF_KIND: usize = PAGE_HEADER;
 const OFF_LEVEL: usize = PAGE_HEADER + 1;
@@ -14,9 +15,13 @@ pub const NODE_HEADER: usize = 32;
 
 pub const CAPACITY: usize = PAGE_SIZE - NODE_HEADER;
 pub const MAX_KEY: usize = 512;
-pub const MAX_VALUE: usize = 1500;
-// no overflow pages, so the biggest cell has to leave room for several others
-pub const MAX_LEAF_CELL: usize = 4 + MAX_KEY + MAX_VALUE;
+// values up to this stay in the leaf cell; bigger ones spill into a chain of overflow pages.
+// the cap keeps a leaf cell small enough that any two always fit on one page
+pub const MAX_INLINE: usize = 1500;
+// one mini-transaction latches the whole chain, so this is also bounded by pool size
+pub const MAX_VALUE: usize = 256 * 1024;
+pub const MAX_LEAF_CELL: usize = 4 + MAX_KEY + 1 + MAX_INLINE;
+pub const OVF_CAP: usize = PAGE_SIZE - NODE_HEADER;
 pub const MAX_INTERNAL_CELL: usize = 6 + MAX_KEY;
 pub const MIN_FILL: usize = CAPACITY / 4;
 
@@ -149,6 +154,11 @@ impl<P: AsRef<[u8]>> Node<P> {
         }
     }
 
+    pub fn overflow_data(&self) -> &[u8] {
+        let n = self.len();
+        &self.b()[NODE_HEADER..NODE_HEADER + n]
+    }
+
     pub fn leaf_entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         (0..self.len()).map(|i| (self.key(i).to_vec(), self.val(i).to_vec())).collect()
     }
@@ -244,6 +254,13 @@ impl<P: AsRef<[u8]> + AsMut<[u8]>> Node<P> {
         self.put16(OFF_N, n - 1);
         let f = self.free_bytes();
         self.put16(OFF_FREE, f + l + 2);
+    }
+
+    // overflow page: chunk length lives in the key-count slot, next page in link
+    pub fn init_overflow(&mut self, next: PageId, data: &[u8]) {
+        self.init(KIND_OVERFLOW, 0, next);
+        self.put16(OFF_N, data.len());
+        self.bm()[NODE_HEADER..NODE_HEADER + data.len()].copy_from_slice(data);
     }
 
     pub fn fill_leaf(&mut self, ents: &[(Vec<u8>, Vec<u8>)], next: PageId) {

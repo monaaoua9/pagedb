@@ -59,5 +59,5 @@ bulk insert, where SQLite's tighter write path wins by about 30%. Run it with
 
 ## Limits
 
-Keys ≤ 512 bytes, values ≤ 1500 bytes (no overflow pages).
+Keys ≤ 512 bytes, values ≤ 256 KiB (larger than 1500 bytes spills into overflow pages).
 Log is not truncated. Locking reads, no MVCC. See the architecture doc for the full list.

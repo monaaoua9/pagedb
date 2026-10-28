@@ -61,8 +61,11 @@ so "does it fit" is O(1); fragmentation is repaired by compaction on demand.
 * Leaf cell `klen|vlen|key|value`, internal cell `child|klen|key`. n keys, n+1 children, the
   rightmost child lives in the header `link`. Child *i* holds keys `< key[i]`, child *i+1* holds
   keys `>= key[i]`.
-* Variable-length keys (≤ 512 B) and values (≤ 1500 B). No overflow pages, the limits are
-  chosen so any two cells fit on a page, which is what makes splits always possible.
+* Variable-length keys (≤ 512 B). Values ≤ 1500 B live in the leaf cell; bigger ones (up to 256 KiB)
+  spill into a chain of overflow pages and the cell keeps `tag | length | first page`. The cell cap is
+  what guarantees any two cells fit on a page, which makes splits always possible. A chain is built,
+  replaced and freed inside the same mini-transaction as the tree change, so it is atomic and logged
+  like everything else; undo re-creates the value logically.
 * **The root page id never changes.** A root split copies the halves into two new pages and
   rewrites the root in place, so catalog entries stay valid forever.
 * Leaves are chained through `link` for range scans.
@@ -151,7 +154,7 @@ Strict two-phase locking, so schedules are serializable.
 
 ## What is deliberately not here
 
-* No overflow pages (hard key/value limits), no SQL layer, no secondary indexes.
+* No SQL layer yet, no secondary indexes.
 * (done) Freed pages are chained into a persistent free list headed in page 0, updated inside the
   same log record as the merge that freed them, so they survive crashes and get reused.
 * The log is never truncated/archived; a checkpoint only shortens recovery.

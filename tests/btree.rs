@@ -74,7 +74,7 @@ fn duplicate_insert_is_rejected_and_put_replaces() {
 fn limits_are_enforced() {
     let e = env("limits", 32);
     assert!(e.tree.put(&vec![1u8; 513], b"", &SYS).is_err());
-    assert!(e.tree.put(b"k", &vec![1u8; 1501], &SYS).is_err());
+    assert!(e.tree.put(b"k", &vec![1u8; 256 * 1024 + 1], &SYS).is_err());
     // the largest allowed cells still split correctly
     for i in 0..200u32 {
         let mut k = vec![b'k'; 500];
