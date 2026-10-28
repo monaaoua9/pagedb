@@ -58,14 +58,14 @@ against pagedb and SQLite via `rusqlite`: 200k rows, 4-byte key, 100-byte value,
 
 | | pagedb | SQLite |
 |---|---|---|
-| bulk insert (200-row transactions) | 71k rows/s | 92k rows/s |
-| random point read | 517k ops/s | 161k ops/s |
-| full scan, 200k rows | 46 ms | 82 ms |
-| single-row commit (fsync each) | 1056 tps | 825 tps |
+| bulk insert (200-row transactions) | 67k rows/s | 89k rows/s |
+| random point read | 508k ops/s | 196k ops/s |
+| full scan, 200k rows | 49 ms | 71 ms |
+| single-row commit (fsync each) | 1086 tps | 990 tps |
 
 Read this fairly: SQLite is parsing and executing SQL and pagedb is a bare key/value API, so the read
 numbers say more about that overhead than about B-tree quality. The one workload where pagedb loses is
-bulk insert, where SQLite's tighter write path wins by about 30%. Run it with
+bulk insert, where SQLite's tighter write path wins by about 25%. Run it with
 `cd bench && cargo run --release`; numbers depend heavily on the disk.
 
 ## Limits
