@@ -154,7 +154,7 @@ Strict two-phase locking, so schedules are serializable.
 
 ## What is deliberately not here
 
-* No SQL layer yet, no secondary indexes.
+* SQL is a small subset (below); no joins, no secondary indexes, no GROUP BY.
 * (done) Freed pages are chained into a persistent free list headed in page 0, updated inside the
   same log record as the merge that freed them, so they survive crashes and get reused.
 * The log is never truncated/archived; a checkpoint only shortens recovery.
@@ -178,3 +178,23 @@ ops, tiny pools, concurrent writers/scanners/deleters, structure check), transac
 cut commit record) and a **crash fuzzer** that randomly commits / rolls back / abandons
 transactions, kills the process state, recovers, and compares against a model across many
 rounds.
+
+## SQL layer
+
+`sql/` sits on the public transaction API only. `Session::execute` parses one statement
+(`CREATE TABLE`, `INSERT`, `SELECT` with `WHERE` / `ORDER BY` / `LIMIT` / `COUNT(*)` / `SUM`, `UPDATE`,
+`DELETE`, `BEGIN` / `COMMIT` / `ROLLBACK`) and runs it in the session's transaction, or in its own
+autocommitted one.
+
+* Column types are `INT` (i64) and `TEXT`; exactly one `PRIMARY KEY` column.
+* A table `t` is the engine table `sql.t`. Its schema is a row in the `sql_schema` table, written in the
+  same transaction as the `CREATE`.
+* Row key = the primary key, encoded to sort the same under byte comparison (ints are big-endian with the
+  sign bit flipped). Row value = every column, tagged.
+* Planner: `pk = const` becomes a point get, `pk` comparisons against constants narrow a range scan,
+  anything else is a full scan. The whole `WHERE` is re-checked on every row returned.
+* Locking: reads take the engine's row S / table S locks. `UPDATE` / `DELETE` read under X (row X for a
+  point lookup, table X for a scan) so two writers queue instead of deadlocking on an S to X upgrade.
+* DDL is not rolled back with the transaction beyond the schema row; a rolled-back `CREATE TABLE` leaves
+  an empty tree that a later `CREATE` of the same name reuses. An error inside an explicit transaction
+  leaves earlier statements' effects in place until you `ROLLBACK`.

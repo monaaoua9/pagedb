@@ -28,6 +28,16 @@ let rows = tx.scan(&users, std::ops::Bound::Unbounded, std::ops::Bound::Unbounde
 | WAL, undo/redo, crash recovery | `wal/` |
 | shared / exclusive row and table locks | `txn/lock.rs` |
 
+There is also a small SQL layer on top (`CREATE TABLE`, `INSERT`, `SELECT ... WHERE / ORDER BY / LIMIT`,
+`COUNT` / `SUM`, `UPDATE`, `DELETE`, `BEGIN` / `COMMIT` / `ROLLBACK`):
+
+```rust
+let mut s = pagedb::Session::new(&db)?;
+s.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")?;
+s.execute("INSERT INTO users VALUES (1, 'ada'), (2, 'grace')")?;
+let r = s.execute("SELECT name FROM users WHERE id >= 2")?;
+```
+
 Design notes, invariants and the recovery protocol: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Run it
@@ -36,6 +46,7 @@ Design notes, invariants and the recovery protocol: [docs/ARCHITECTURE.md](docs/
 cargo test                           # unit + integration + crash fuzzer
 cargo run --release --example demo   # crash with a transaction in flight, recover
 cargo run --release --example bench   # quick numbers
+cargo run --release --example sql_shell   # interactive SQL prompt
 (cd bench && cargo run --release)    # pagedb vs SQLite
 ```
 

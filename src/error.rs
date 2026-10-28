@@ -15,6 +15,7 @@ pub enum Error {
     NoSuchTable(String),
     TableExists(String),
     TxnClosed,
+    Sql(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -34,6 +35,7 @@ impl fmt::Display for Error {
             Error::NoSuchTable(t) => write!(f, "no such table: {t}"),
             Error::TableExists(t) => write!(f, "table exists: {t}"),
             Error::TxnClosed => write!(f, "transaction already finished"),
+            Error::Sql(m) => write!(f, "sql: {m}"),
         }
     }
 }

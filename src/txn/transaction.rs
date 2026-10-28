@@ -98,6 +98,25 @@ impl Transaction {
         t.tree().scan(lower, upper)
     }
 
+    // locks the row exclusively up front; for read-modify-write so two of them queue up
+    // instead of both taking S and deadlocking on the upgrade
+    pub fn get_for_update(&mut self, t: &Table, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.for_write(t, key)?;
+        t.tree().get(key)
+    }
+
+    // scan under a table-level X lock, for statements that will write what they read
+    pub fn scan_for_update(
+        &mut self,
+        t: &Table,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.live()?;
+        self.table_lock(t, LockMode::X)?;
+        t.tree().scan(lower, upper)
+    }
+
     pub fn commit(mut self) -> Result<()> {
         self.live()?;
         self.done = true;
