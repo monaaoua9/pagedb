@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
@@ -25,7 +26,7 @@ struct Frame {
 }
 
 struct State {
-    table: HashMap<PageId, usize>,
+    table: HashMap<PageId, usize, BuildHasherDefault<PageHash>>,
     free: Vec<usize>,
     lru: LruK,
 }
@@ -40,6 +41,25 @@ pub struct PoolStats {
 // Metadata (page table, replacer) sits behind one mutex and disk reads/evictions
 // happen under it. Simple and obviously correct; sharding the table is the next
 // step if this ever shows up in a profile.
+// page ids are small dense integers and the table sits under the pool mutex on every
+// fetch, so SipHash is wasted effort here
+#[derive(Default)]
+struct PageHash(u64);
+
+impl Hasher for PageHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0 ^ x as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
 pub struct BufferPool {
     disk: Arc<DiskManager>,
     frames: Box<[Frame]>,
@@ -66,7 +86,7 @@ impl BufferPool {
             disk,
             frames: frames.into_boxed_slice(),
             state: Mutex::new(State {
-                table: HashMap::new(),
+                table: HashMap::default(),
                 free: (0..size).rev().collect(),
                 lru: LruK::new(size, 2),
             }),
@@ -366,7 +386,9 @@ impl<'a> WriteGuard<'a> {
             fr.rec_lsn.store(lsn, Release);
         }
         self.touched = false;
-        self.before = None;
+        if let Some(b) = self.before.take() {
+            recycle(b);
+        }
         self.fresh = false;
     }
 
@@ -401,15 +423,34 @@ impl Deref for WriteGuard<'_> {
 impl DerefMut for WriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut PageData {
         if !self.touched {
-            self.before = Some(Box::new(***self.g));
+            let mut b = SPARE.with(|s| s.borrow_mut().pop()).unwrap_or_else(|| Box::new([0u8; PAGE_SIZE]));
+            b.copy_from_slice(&***self.g);
+            self.before = Some(b);
             self.touched = true;
         }
         &mut self.g
     }
 }
 
+thread_local! {
+    // before-images are 8 KiB and one is taken per page per mini-transaction
+    static SPARE: std::cell::RefCell<Vec<Box<PageData>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn recycle(b: Box<PageData>) {
+    SPARE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() < 8 {
+            s.push(b);
+        }
+    });
+}
+
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
+        if let Some(b) = self.before.take() {
+            recycle(b);
+        }
         let fr = &self.pool.frames[self.f];
         // raw users of the pool (no mini-transaction) just want dirty tracking
         if self.touched {

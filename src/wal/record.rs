@@ -43,6 +43,9 @@ const GAP: usize = 8;
 // first differing offset at or after `i`, PAGE_SIZE if none. skips 64 bytes at a
 // time with a slice compare (memcmp) since most of a page is untouched
 fn next_diff(a: &PageData, b: &PageData, mut i: usize) -> usize {
+    while i + 512 <= PAGE_SIZE && a[i..i + 512] == b[i..i + 512] {
+        i += 512;
+    }
     while i + 64 <= PAGE_SIZE && a[i..i + 64] == b[i..i + 64] {
         i += 64;
     }
