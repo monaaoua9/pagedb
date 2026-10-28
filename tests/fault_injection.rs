@@ -9,7 +9,7 @@ use pagedb::{failpoint, Database, Error, Options};
 type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn opts() -> Options {
-    Options { pool_pages: 16, checkpoint_bytes: 64 << 10, ..Options::default() }
+    Options { pool_pages: 16, checkpoint_bytes: 64 << 10, truncate_bytes: 1, ..Options::default() }
 }
 
 struct Outcome {

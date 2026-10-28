@@ -129,6 +129,17 @@ the data file is fsynced.
 
 A torn log tail (partial last frame) is detected by CRC at open and truncated.
 
+### Log truncation
+
+After a checkpoint the front of the log is dead up to
+`keep = min(checkpoint lsn, oldest rec_lsn in its dirty page table, first record of every running transaction)`:
+redo never starts before the first, undo never walks past the last. If at least `Options::truncate_bytes`
+(1 MiB) of log lies before `keep`, the rest is copied into a new file `wal.log.<gen>` whose header holds
+its starting LSN, so LSNs keep growing and nothing already stamped on a page changes meaning. The master
+record (`wal.master`, which already switched atomically via tmp + rename) carries the generation; flipping it
+is the commit point. A crash before that leaves the old file in charge, after it the new one, and `open`
+deletes whichever is unused. No rename over an open file, which Windows won't do.
+
 ### txn: concurrency control
 Strict two-phase locking, so schedules are serializable.
 
@@ -157,7 +168,6 @@ Strict two-phase locking, so schedules are serializable.
 * SQL is a small subset (below); no joins, no secondary indexes, no GROUP BY.
 * (done) Freed pages are chained into a persistent free list headed in page 0, updated inside the
   same log record as the merge that freed them, so they survive crashes and get reused.
-* The log is never truncated/archived; a checkpoint only shortens recovery.
 * Reads are lock-based, not MVCC; long scans block writers on that table.
 * Single node, no replication, no encryption.
 

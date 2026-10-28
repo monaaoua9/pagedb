@@ -35,6 +35,11 @@ impl TxnManager {
         lock(&self.active).len()
     }
 
+    // oldest log record any running transaction might still have to undo
+    pub fn min_first_lsn(&self) -> Option<Lsn> {
+        lock(&self.active).values().map(|c| c.first_lsn.load(Acquire)).filter(|&l| l != 0).min()
+    }
+
     // read-only transactions have never logged anything and don't need to be known to recovery
     pub fn snapshot(&self) -> Vec<(TxnId, Lsn, bool)> {
         lock(&self.active)

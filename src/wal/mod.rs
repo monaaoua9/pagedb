@@ -14,12 +14,18 @@ pub use record::{Record, Undo};
 // what the log needs to know about a running transaction
 pub struct TxnCtx {
     pub id: TxnId,
+    pub first_lsn: AtomicU64,
     pub last_lsn: AtomicU64,
     pub committed: AtomicBool,
 }
 
 impl TxnCtx {
     pub fn new(id: TxnId, last_lsn: Lsn) -> Self {
-        TxnCtx { id, last_lsn: AtomicU64::new(last_lsn), committed: AtomicBool::new(false) }
+        TxnCtx {
+            id,
+            first_lsn: AtomicU64::new(0),
+            last_lsn: AtomicU64::new(last_lsn),
+            committed: AtomicBool::new(false),
+        }
     }
 }

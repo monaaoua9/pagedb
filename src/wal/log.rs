@@ -19,15 +19,21 @@ const AUTO_FLUSH: usize = 4 << 20;
 
 struct Inner {
     file: File,
-    // everything below this offset is on disk and fsynced
+    // lsn of the first record in the file; physical offset = lsn - base + LOG_START
+    base: u64,
+    // which wal file we're on, bumped each time the front of the log is cut off
+    gen: u64,
+    // everything below this lsn is on disk and fsynced
     durable: u64,
     buf: Vec<u8>,
 }
 
-// An LSN is the byte offset of the record's frame, so it doubles as a seek
-// address. Frame = len u32 | crc u32 | payload.
+// An LSN is the byte offset of the record's frame in the logical log, which
+// only ever grows. Truncation starts a new file whose header says where it
+// begins. Frame = len u32 | crc u32 | payload.
 pub struct LogManager {
     inner: Mutex<Inner>,
+    path: PathBuf,
     // mini-transactions hold this shared while they append and stamp pages;
     // a checkpoint takes it exclusive to get a snapshot with nothing half-logged
     gate: RwLock<()>,
@@ -53,41 +59,83 @@ fn read_frame(f: &File, off: u64, limit: u64) -> Option<(Vec<u8>, u64)> {
     if read_full_at(f, &mut p, off + FRAME_HDR).ok()? != p.len() {
         return None;
     }
-    (crc32(&[&p]) == crc).then_some((p, off + FRAME_HDR + len))
+    (crc32(&[&p]) == crc).then_some((p, FRAME_HDR + len))
+}
+
+fn gen_path(path: &Path, gen: u64) -> PathBuf {
+    if gen == 0 {
+        return path.to_path_buf();
+    }
+    let mut s = path.as_os_str().to_owned();
+    s.push(format!(".{gen}"));
+    PathBuf::from(s)
+}
+
+fn write_master(path: &Path, lsn: Lsn, gen: u64) -> Result<()> {
+    let mut b = lsn.to_le_bytes().to_vec();
+    b.extend_from_slice(&gen.to_le_bytes());
+    b.extend_from_slice(&crc32(&[&b]).to_le_bytes());
+    crate::failpoint::hit()?;
+    let tmp = path.with_extension("master.tmp");
+    {
+        let f = File::create(&tmp)?;
+        write_all_at(&f, &b, 0)?;
+        f.sync_all()?;
+    }
+    crate::failpoint::hit()?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 impl LogManager {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let mut master = path.to_path_buf();
+        master.set_extension("master");
+        let (mck, gen) = read_master(&master).unwrap_or((0, 0));
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(gen_path(path, gen))?;
         let mut len = file.metadata()?.len();
+        let mut base = LOG_START;
         if len < LOG_START {
             let mut hdr = [0u8; 16];
             hdr[..8].copy_from_slice(MAGIC);
+            hdr[8..].copy_from_slice(&LOG_START.to_le_bytes());
             file.set_len(0)?;
             write_all_at(&file, &hdr, 0)?;
             file.sync_data()?;
             len = LOG_START;
         } else {
-            let mut hdr = [0u8; 8];
+            let mut hdr = [0u8; 16];
             read_full_at(&file, &mut hdr, 0)?;
-            if &hdr != MAGIC {
+            if &hdr[..8] != MAGIC {
                 return corrupt("bad wal magic");
             }
+            base = u64::from_le_bytes(hdr[8..].try_into().unwrap()).max(LOG_START);
+        }
+        // leftovers from a truncation that died half way, or an old file we never got to delete
+        let _ = fs::remove_file(gen_path(path, gen + 1));
+        if gen > 0 {
+            let _ = fs::remove_file(gen_path(path, gen - 1));
         }
 
-        let mut master = path.to_path_buf();
-        master.set_extension("master");
-        let ckpt = read_master(&master).filter(|&l| {
+        let phys = |l: Lsn| l - base + LOG_START;
+        let ckpt = (mck != 0).then_some(mck).filter(|&l| {
             // a master pointing at garbage (or past the end) is ignored
-            read_frame(&file, l, len)
-                .map(|(p, _)| matches!(Record::decode(&p), Ok(Record::Checkpoint { .. })))
-                .unwrap_or(false)
+            l >= base
+                && read_frame(&file, phys(l), len)
+                    .map(|(p, _)| matches!(Record::decode(&p), Ok(Record::Checkpoint { .. })))
+                    .unwrap_or(false)
         });
 
         // find the end of the valid prefix; a torn tail from the last crash is cut off
-        let mut end = ckpt.unwrap_or(LOG_START);
-        while let Some((_, next)) = read_frame(&file, end, len) {
-            end = next;
+        let mut end = ckpt.map_or(LOG_START, phys);
+        while let Some((_, n)) = read_frame(&file, end, len) {
+            end += n;
         }
         if end < len {
             file.set_len(end)?;
@@ -95,7 +143,8 @@ impl LogManager {
         }
 
         Ok(LogManager {
-            inner: Mutex::new(Inner { file, durable: end, buf: Vec::new() }),
+            inner: Mutex::new(Inner { file, base, gen, durable: end - LOG_START + base, buf: Vec::new() }),
+            path: path.to_path_buf(),
             gate: RwLock::new(()),
             master,
             ckpt: AtomicU64::new(ckpt.unwrap_or(0)),
@@ -128,6 +177,9 @@ impl LogManager {
     pub fn append_chained(&self, ctx: &TxnCtx, make: impl FnOnce(Lsn) -> Record) -> Result<Lsn> {
         let rec = make(ctx.last_lsn.load(Acquire));
         let lsn = self.append(&rec)?;
+        if ctx.first_lsn.load(Acquire) == 0 {
+            ctx.first_lsn.store(lsn, Release);
+        }
         ctx.last_lsn.store(lsn, Release);
         if matches!(rec, Record::Commit { .. }) {
             ctx.committed.store(true, Release);
@@ -146,11 +198,11 @@ impl LogManager {
         }
         if let Err(e) = crate::failpoint::hit() {
             if crate::failpoint::torn() {
-                write_all_at(&g.file, &g.buf[..g.buf.len() / 2], g.durable)?;
+                write_all_at(&g.file, &g.buf[..g.buf.len() / 2], g.durable - g.base + LOG_START)?;
             }
             return Err(e);
         }
-        write_all_at(&g.file, &g.buf, g.durable)?;
+        write_all_at(&g.file, &g.buf, g.durable - g.base + LOG_START)?;
         // data is in the file but we may die before learning the sync finished
         crate::failpoint::hit()?;
         g.file.sync_data()?;
@@ -199,14 +251,18 @@ impl LogManager {
             let body = &g.buf[off + 8..off + 8 + len];
             return Ok((Record::decode(body)?, lsn + FRAME_HDR + len as u64));
         }
-        match read_frame(&g.file, lsn, g.durable) {
-            Some((p, next)) => Ok((Record::decode(&p)?, next)),
+        if lsn < g.base {
+            return corrupt(format!("lsn {lsn} was truncated away"));
+        }
+        let limit = g.durable - g.base + LOG_START;
+        match read_frame(&g.file, lsn - g.base + LOG_START, limit) {
+            Some((p, n)) => Ok((Record::decode(&p)?, lsn + n)),
             None => corrupt(format!("no valid log record at lsn {lsn}")),
         }
     }
 
     pub fn iter_from(&self, lsn: Lsn) -> LogIter<'_> {
-        LogIter { log: self, next: lsn.max(LOG_START) }
+        LogIter { log: self, next: lsn.max(lock(&self.inner).base) }
     }
 
     pub fn checkpoint_lsn(&self) -> Lsn {
@@ -214,18 +270,55 @@ impl LogManager {
     }
 
     pub fn set_checkpoint(&self, lsn: Lsn) -> Result<()> {
-        let mut b = lsn.to_le_bytes().to_vec();
-        b.extend_from_slice(&crc32(&[&b]).to_le_bytes());
-        crate::failpoint::hit()?;
-        let tmp = self.master.with_extension("master.tmp");
-        {
-            let f = File::create(&tmp)?;
-            write_all_at(&f, &b, 0)?;
-            f.sync_all()?;
+        let gen = lock(&self.inner).gen;
+        write_master(&self.master, lsn, gen)?;
+        self.ckpt.store(lsn, Release);
+        Ok(())
+    }
+
+    pub fn base_lsn(&self) -> Lsn {
+        lock(&self.inner).base
+    }
+
+    // Drops everything before `keep` (a record boundary) by copying the rest into a
+    // new file and switching the master record over to it. No rename over an open
+    // file, which Windows doesn't like; a crash anywhere leaves either the old or
+    // the new file as the one the master names, and open() deletes the other.
+    pub fn truncate_before(&self, keep: Lsn) -> Result<()> {
+        let mut g = lock(&self.inner);
+        if keep <= g.base || self.crashed.load(Acquire) {
+            return Ok(());
+        }
+        Self::flush_locked(&mut g)?;
+        let ngen = g.gen + 1;
+        let npath = gen_path(&self.path, ngen);
+        let nf = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&npath)?;
+        let mut hdr = [0u8; 16];
+        hdr[..8].copy_from_slice(MAGIC);
+        hdr[8..].copy_from_slice(&keep.to_le_bytes());
+        write_all_at(&nf, &hdr, 0)?;
+
+        let (mut src, end) = (keep - g.base + LOG_START, g.durable - g.base + LOG_START);
+        let mut dst = LOG_START;
+        let mut chunk = vec![0u8; 1 << 20];
+        while src < end {
+            let n = chunk.len().min((end - src) as usize);
+            if read_full_at(&g.file, &mut chunk[..n], src)? != n {
+                return corrupt("short read while truncating the log");
+            }
+            write_all_at(&nf, &chunk[..n], dst)?;
+            src += n as u64;
+            dst += n as u64;
         }
         crate::failpoint::hit()?;
-        fs::rename(&tmp, &self.master)?;
-        self.ckpt.store(lsn, Release);
+        nf.sync_all()?;
+        write_master(&self.master, self.ckpt.load(Acquire), ngen)?;
+
+        let old = gen_path(&self.path, g.gen);
+        g.file = nf;
+        g.base = keep;
+        g.gen = ngen;
+        let _ = fs::remove_file(old);
         Ok(())
     }
 
@@ -235,13 +328,18 @@ impl LogManager {
     }
 }
 
-fn read_master(p: &Path) -> Option<Lsn> {
+fn read_master(p: &Path) -> Option<(Lsn, u64)> {
     let b = fs::read(p).ok()?;
-    if b.len() != 12 {
+    let n = match b.len() {
+        12 | 20 => b.len() - 4,
+        _ => return None,
+    };
+    let crc = u32::from_le_bytes(b[n..].try_into().unwrap());
+    if crc32(&[&b[..n]]) != crc {
         return None;
     }
-    let crc = u32::from_le_bytes(b[8..12].try_into().unwrap());
-    (crc32(&[&b[..8]]) == crc).then(|| u64::from_le_bytes(b[..8].try_into().unwrap()))
+    let gen = if n == 16 { u64::from_le_bytes(b[8..16].try_into().unwrap()) } else { 0 };
+    Some((u64::from_le_bytes(b[..8].try_into().unwrap()), gen))
 }
 
 impl LogFlusher for LogManager {

@@ -12,7 +12,7 @@ use crate::error::{corrupt, Error, Result};
 use crate::storage::DiskManager;
 use crate::sync::{lock, read, write};
 use crate::txn::{LockManager, Transaction, TxnManager};
-use crate::types::{Lsn, PageId, INVALID_PAGE, PAGE_HEADER};
+use crate::types::{PageId, INVALID_PAGE, PAGE_HEADER};
 use crate::wal::recovery::{recover, RecoveryReport};
 use crate::wal::{Kind, LogManager, Mtr, Record};
 
@@ -26,11 +26,18 @@ pub struct Options {
     pub lock_timeout: Duration,
     // log growth between automatic checkpoints
     pub checkpoint_bytes: u64,
+    // a checkpoint cuts the front off the log once at least this much of it is dead
+    pub truncate_bytes: u64,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { pool_pages: 1024, lock_timeout: Duration::from_secs(5), checkpoint_bytes: 16 << 20 }
+        Options {
+            pool_pages: 1024,
+            lock_timeout: Duration::from_secs(5),
+            checkpoint_bytes: 16 << 20,
+            truncate_bytes: 1 << 20,
+        }
     }
 }
 
@@ -87,17 +94,24 @@ impl Engine {
     // with the log gate closed so no mini-transaction is half-logged.
     fn checkpoint_inner(&self) -> Result<()> {
         self.pool.flush_all()?;
-        let lsn: Lsn = {
+        let (lsn, keep) = {
             let _gate = self.log.gate_write();
             let att = self.txns.snapshot();
             let dpt = self.pool.dirty_page_table();
-            self.log.append(&Record::Checkpoint { next_txn: self.txns.next_id(), att, dpt })?
+            // recovery from this checkpoint needs redo from the oldest dirty page and
+            // undo back to the first record of every transaction still running
+            let oldest = dpt.iter().map(|d| d.1).chain(self.txns.min_first_lsn()).min();
+            let lsn = self.log.append(&Record::Checkpoint { next_txn: self.txns.next_id(), att, dpt })?;
+            (lsn, oldest.map_or(lsn, |o| o.min(lsn)))
         };
         // writes of pages that looked clean in the snapshot must be on disk
         // before the master record starts trusting the snapshot
         self.disk.sync()?;
         self.log.flush_to(lsn)?;
         self.log.set_checkpoint(lsn)?;
+        if keep - self.log.base_lsn() >= self.opts.truncate_bytes.max(1) {
+            self.log.truncate_before(keep)?;
+        }
         self.ckpt_at.store(self.log.end_lsn(), Release);
         Ok(())
     }
