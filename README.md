@@ -38,7 +38,7 @@ s.execute("INSERT INTO users VALUES (1, 'ada'), (2, 'grace')")?;
 let r = s.execute("SELECT name FROM users WHERE id >= 2")?;
 ```
 
-Design notes, invariants and the recovery protocol: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Design notes, invariants and the recovery protocol: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). A shorter list of the decisions and their trade-offs: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Run it
 
